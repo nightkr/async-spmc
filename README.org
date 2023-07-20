@@ -1,0 +1,39 @@
+#+TITLE: SPMC (single-producer, multi-consumer) channels
+
+This is an implementation of SPMC channels by effectively inverting a MPSC (multi-producer, single-consumer) channel. Each ready consumer sends a oneshot channel
+into the MPSC channel. The producer tries to grab any available oneshot channel and fulfils it.
+
+* (Not-so) FAQ
+
+** Is it fast?
+
+No. It's around 5x slower than the underlying MPSC channel under the best of circumstances.
+
+** Is it stable?
+
+No, it seems to explode and deadlock somewhere between 20 and 30 consumers.
+
+** Is it reliable?
+
+No, a receiver will drop any pending message when dropped.
+
+** Can it summon nostril demons?
+
+Not by itself. ~futures::channel~ might though, who knows?
+
+** Does it depend on Tokio?
+
+No.
+
+** Is it on crates.io?
+
+No.
+
+** Why?
+
+Sometimes experiments have to be carried out, however ill-advised.
+
+** Is it Cyber Resilience Act-compliant?
+
+Probably not.
+

@@ -1,4 +1,5 @@
 #![cfg_attr(feature = "bench", feature(test))]
+#![forbid(unsafe_code)]
 
 use std::{
     pin::Pin,

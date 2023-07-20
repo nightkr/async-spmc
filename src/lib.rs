@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "bench", feature(test))]
+
 use std::{
     pin::Pin,
     task::{ready, Context, Poll},
@@ -64,25 +66,32 @@ pub struct Sender<T> {
 
 impl<T> Unpin for Sender<T> {}
 
-impl<T> Sink<T> for Sender<T> {
-    type Error = SendError;
-
-    #[tracing::instrument(skip(self, cx))]
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(if self.active_txer.is_some() {
+impl<T> Sender<T> {
+    fn poll_txer(&mut self, cx: &mut Context<'_>) -> Poll<Result<oneshot::Sender<T>, SendError>> {
+        Poll::Ready(if let Some(txer) = self.active_txer.take() {
             trace!("txer is ready");
-            Ok(())
+            Ok(txer)
         } else {
             trace!("polling for txer");
             match ready!(self.txer_rx.poll_next_unpin(cx)) {
                 Some(txer) => {
                     trace!("got txer!");
-                    self.active_txer = Some(txer);
-                    Ok(())
+                    Ok(txer)
                 }
                 None => Err(SendError::Closed),
             }
         })
+    }
+}
+
+impl<T> Sink<T> for Sender<T> {
+    type Error = SendError;
+
+    #[tracing::instrument(skip(self, cx))]
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx)?);
+        self.active_txer = Some(ready!(self.poll_txer(cx)?));
+        Poll::Ready(Ok(()))
     }
 
     #[tracing::instrument(skip(self, item))]
@@ -97,14 +106,9 @@ impl<T> Sink<T> for Sender<T> {
         loop {
             if self.output_buf.is_some() {
                 trace!("has output buffer, grabbing txer");
-                ready!(self.as_mut().poll_ready(cx)?);
+                let txer = ready!(self.poll_txer(cx)?);
                 trace!("got txer, trying to send");
-                match self
-                    .active_txer
-                    .take()
-                    .unwrap()
-                    .send(self.output_buf.take().unwrap())
-                {
+                match txer.send(self.output_buf.take().unwrap()) {
                     Ok(()) => trace!("tx successful, yay!"),
                     Err(output_buf) => {
                         trace!("tx failed, requeueing");
@@ -143,6 +147,9 @@ pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "bench")]
+    extern crate test;
+
     use std::collections::HashSet;
 
     use futures::{future, poll, stream, SinkExt, StreamExt, TryStreamExt};
@@ -261,5 +268,127 @@ mod tests {
         }
         .instrument(info_span!("test_send_to_dropped_rxer"))
         .await
+    }
+
+    #[tokio::test]
+    #[ignore = "currently broken"]
+    async fn test_send_to_dropped_rxer_after_flush() {
+        Lazy::force(&INIT_LOG);
+        async {
+            let (mut tx, mut rx) = channel(5);
+            let mut tmp_rx = rx.clone();
+            // init tmp_rx to wait for a message
+            assert!(poll!(tmp_rx.next()).is_pending());
+            assert!(tmp_rx.active_rxer.is_some());
+            assert!(rx.active_rxer.is_none());
+            // try to send
+            tx.send(1).await.unwrap();
+            // drop tmp_rx before the message has been received
+            drop(tmp_rx);
+            // confirm that the message was instead received by rx once flushed
+            let rxed = tokio::spawn(async move { rx.next().await }.in_current_span());
+            tx.close().await.unwrap();
+            assert_eq!(rxed.await.unwrap(), Some(1));
+        }
+        .instrument(info_span!("test_send_to_dropped_rxer_after_flush"))
+        .await
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn bench_mpsc_single_rxer(b: &mut test::Bencher) {
+        use futures::channel::mpsc;
+        use tokio::runtime;
+
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let (tx, rx) = mpsc::channel(5);
+                let txer = rt.spawn(async {
+                    let mut tx = tx;
+                    tx.send_all(&mut stream::iter(0..1000).map(Ok))
+                        .await
+                        .unwrap();
+                });
+                assert_eq!(rx.collect::<Vec<_>>().await, (0..1000).collect::<Vec<_>>());
+                txer.await.unwrap();
+            })
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn bench_single_rxer(b: &mut test::Bencher) {
+        use tokio::runtime;
+
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let (tx, rx) = channel(5);
+                let txer = rt.spawn(async {
+                    let mut tx = tx;
+                    tx.send_all(&mut stream::iter(0..1000).map(Ok))
+                        .await
+                        .unwrap();
+                });
+                assert_eq!(rx.collect::<Vec<_>>().await, (0..1000).collect::<Vec<_>>());
+                txer.await.unwrap();
+            })
+        });
+    }
+
+    fn bench_multi_rxers(b: &mut test::Bencher, rxer_count: u32) {
+        use futures::future::join_all;
+        use tokio::runtime;
+
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let (mut tx, rx) = channel(50000);
+                let rxers =
+                    join_all((0..rxer_count).map(|_| rt.spawn(rx.clone().collect::<Vec<_>>())));
+                tx.send_all(&mut stream::iter(0..1000).map(Ok))
+                    .await
+                    .unwrap();
+                tx.close().await.unwrap();
+                let mut rxed = HashSet::new();
+                for msgs in rxers.await {
+                    rxed.extend(msgs.unwrap());
+                }
+                assert_eq!(rxed, (0..1000).collect::<HashSet<_>>());
+            })
+        });
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn bench_1_rxer(b: &mut test::Bencher) {
+        bench_multi_rxers(b, 1);
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn bench_10_rxers(b: &mut test::Bencher) {
+        bench_multi_rxers(b, 10);
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn bench_20_rxers(b: &mut test::Bencher) {
+        bench_multi_rxers(b, 20);
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    #[ignore = "too slow"]
+    fn bench_100_rxers(b: &mut test::Bencher) {
+        bench_multi_rxers(b, 100);
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    #[ignore = "too slow"]
+    fn bench_1000_rxers(b: &mut test::Bencher) {
+        bench_multi_rxers(b, 1000);
     }
 }

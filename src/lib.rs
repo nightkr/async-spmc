@@ -337,6 +337,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "bench")]
     fn bench_multi_rxers(b: &mut test::Bencher, rxer_count: u32) {
         use futures::future::join_all;
         use tokio::runtime;
